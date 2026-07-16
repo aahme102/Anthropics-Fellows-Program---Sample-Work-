@@ -1,0 +1,312 @@
+---
+title: "Vacant Building Analysis"
+author: "Anous Ahmed"
+date: 12/11/2025
+format:
+  pdf:
+    toc: true        
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    smooth-scroll: true
+    code-fold: false
+---
+
+```{r}
+library(httr)
+library(jsonlite)
+library(tidyverse)
+library(janitor)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(leaflet)
+library(naniar)
+library(ggplot2)
+```
+
+# Step 1: Choose a Civic Problem
+
+**What are the temporal and geographic patterns of vacant building service requests in Chicago?**
+
+# Step 2: Data Acquisition
+
+```{r}
+url_json <- "https://data.cityofchicago.org/resource/7nii-7srd.json?$limit=50000"
+```
+
+```{r}
+vacant_df <- fromJSON(url_json) %>%
+  as_tibble() %>%
+  clean_names()
+```
+
+```{r}
+glimpse(vacant_df)
+```
+
+# Step 3: Data Wrangling & Quality Checks
+
+```{r}
+# checking for missing values
+gg_miss_var(vacant_df)
+```
+
+```{r}
+# dropping all NAs
+vacant_clean = vacant_df %>%
+  drop_na()
+```
+
+```{r}
+# No missing values left
+gg_miss_var(vacant_clean)
+```
+
+```{r}
+vacant_clean <- vacant_clean %>%
+  clean_names() %>%   
+  rename(
+    creation_date = date_service_request_was_received  
+# rename correctly
+  ) %>%
+  mutate(
+    creation_date = parse_datetime(creation_date),     
+# convert character todatetime
+    year = year(creation_date),
+    month = month(creation_date, label = TRUE),
+    community_area = as.numeric(community_area),
+    ward = as.numeric(ward),
+    police_district = as.numeric(police_district),
+    latitude = as.numeric(latitude),
+    longitude = as.numeric(longitude)
+  ) %>%
+  arrange(creation_date)
+```
+
+```{r}
+vacant_clean <- vacant_clean %>%
+  mutate(
+    is_the_building_vacant_due_to_fire = as.logical(is_the_building_vacant_due_to_fire),
+    any_people_using_property_homeless_childen_gangs = as.logical(any_people_using_property_homeless_childen_gangs)
+  )
+```
+
+```{r}
+vacant_clean <- vacant_clean %>%
+  mutate(
+    across(c(service_request_type,
+             is_building_open_or_boarded,
+             if_the_building_is_open_where_is_the_entry_point,
+             is_the_building_currently_vacant_or_occupied,
+             location_of_building_on_the_lot_if_garage_change_type_code_to_bgd),
+           ~ str_squish(str_to_title(.))
+    ),
+    across(c(address_street_number,
+             address_street_direction,
+             address_street_name,
+             address_street_suffix),
+           ~ str_squish(str_to_title(.))
+    )
+  )
+```
+
+```{r}
+vacant_clean <- vacant_clean %>%
+  distinct(service_request_number, .keep_all = TRUE)
+```
+
+```{r}
+vacant_clean <- vacant_clean %>%
+  mutate(
+    service_request_type = factor(service_request_type),
+    is_building_open_or_boarded = factor(is_building_open_or_boarded),
+    if_the_building_is_open_where_is_the_entry_point = factor(if_the_building_is_open_where_is_the_entry_point),
+    is_the_building_currently_vacant_or_occupied = factor(is_the_building_currently_vacant_or_occupied),
+    month = factor(month, levels = month.abb, ordered = TRUE)
+  )
+```
+
+```{r}
+vacant_clean <- vacant_clean %>%
+  mutate(
+    across(starts_with("computed_region_"), as.factor)
+  )
+```
+
+```{r}
+vacant_clean <- vacant_clean %>%
+  rename(
+    region1 = computed_region_awaf_s7ux,
+    region2 = computed_region_6mkv_f3dw,
+    region3 = computed_region_vrxf_vc4k,
+    region4 = computed_region_bdys_3d7i,
+    region5 = computed_region_43wa_7qmu
+  )
+```
+
+```{r}
+# creating a lookup table
+ca_names <- tibble(
+  ca_num = 1:77,
+  community_name = c(
+    "Rogers Park", "West Ridge", "Uptown", "Lincoln Square", "North Center",
+    "Lake View", "Lincoln Park", "Near North Side", "Edison Park", "Norwood Park",
+    "Jefferson Park", "Forest Glen", "North Park", "Albany Park", "Portage Park",
+    "Irving Park", "Dunning", "Montclare", "Belmont Cragin", "Hermosa",
+    "Avondale", "Logan Square", "Humboldt Park", "West Town", "Austin",
+    "West Garfield Park", "East Garfield Park", "Near West Side", "North Lawndale",
+    "South Lawndale", "Lower West Side", "Loop", "Near South Side", "Armour Square",
+    "Douglas", "Oakland", "Fuller Park", "Grand Boulevard", "Kenwood",
+    "Washington Park", "Hyde Park", "Woodlawn", "South Shore", "Chatham",
+    "Avalon Park", "South Chicago", "Burnside", "Calumet Heights", "Roseland",
+    "Pullman", "South Deering", "East Side", "West Pullman", "Riverdale",
+    "Hegewisch", "Garfield Ridge", "Archer Heights", "Brighton Park", "McKinley Park",
+    "Bridgeport", "New City", "West Elsdon", "Gage Park", "Clearing",
+    "West Lawn", "Chicago Lawn", "West Englewood", "Englewood", "Greater Grand Crossing",
+    "Ashburn", "Auburn Gresham", "Beverly", "Washington Heights", "Mount Greenwood",
+    "Morgan Park", "O'Hare", "Edgewater"
+  )
+)
+```
+
+```{r}
+# Merging the lookup table with the dataset
+vacant_clean <- vacant_clean %>%
+  mutate(ca_num = as.numeric(community_area)) %>%   # convert
+  left_join(ca_names, by = "ca_num")
+```
+
+
+```{r}
+# Final Dataset
+glimpse(vacant_clean)
+```
+
+# Step 4: Reproducible Reporting
+
+```{r}
+vacant_clean %>%
+count(year, month) %>%
+mutate(month = as.character(month),
+date = ymd(paste(year, month, "01"))) %>%
+ggplot(aes(date, n)) +
+geom_line() +
+labs(
+title = "Vacant Building Requests Over Time",
+x = "Date",
+y = "Number of Requests"
+)
+```
+
+This line graph shows how the number of vacant building service requests has changed over time. Each point on the line represents the total requests over a period of time. It is interesting to considering the stark decline in the number of requests post 2013. 
+
+```{r}
+leaflet(vacant_clean) %>%
+addTiles() %>%
+addCircleMarkers(
+lng = ~longitude,
+lat = ~latitude,
+radius = 2,
+stroke = FALSE,
+fillOpacity = 0.5,
+popup = ~paste0("Address: ", address_street_number, " ",
+address_street_name, "",
+"Status: ", is_the_building_currently_vacant_or_occupied)
+)
+```
+
+This interactive Leaflet map visualizes the locations of vacant or occupied buildings in the dataset. Each point represents a building, plotted using its longitude and latitude. The circle markers allow users to explore the spatial distribution of properties across the city, while the popups provide key details such as the address and the building’s vacancy status. This map makes it easy to identify geographic patterns and clusters of vacant buildings.
+
+```{r}
+vacant_clean %>%
+  count(community_name, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  ggplot(aes(x = fct_reorder(community_name, n), y = n, fill = n)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_gradient(low = "skyblue", high = "navy") +  # gradient color
+  labs(
+    title = "Top 10 Community Areas",
+    x = "Community Area",
+    y = "Number of Requests"
+  ) +
+  theme_minimal()
+```
+
+This bar chart shows the top 10 community areas with the highest number of service requests in the dataset. The bars are ordered from most to least requests, making it easy to identify which areas generate the greatest demand. As the graph shows, West Englewood is the community area in Chicago that generates the most 311 Requests for Abandoned/Vacant Buildings. 
+
+```{r}
+# Count open vs boarded buildings
+vacant_clean %>%
+  count(is_building_open_or_boarded) %>%
+  ggplot(aes(x = "", y = n, fill = is_building_open_or_boarded)) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  labs(
+    title = "Proportion of Open vs Boarded Buildings",
+    fill = "Building Status"
+  ) +
+  theme_void()
+```
+
+The graph above illustrates a pie chart of buildings that are reported Open vs Boarded. Considering that there is a greater proportion of open buildings than boarded buildings, the pie chart is illustrative of the physical security or accessibility of vacant properties. Open buildings are unsecured and easily accessible. They can invite crime, squatting, and hazards like fires or waste. Hence, posing a threat to the surrounding community. On the other hand, boarded buildings are more secured and have safe entry/exit points. They are protected in ways that deters trespassers like gangs or drug users and prevent vandalism. 
+
+# Step 5: Advanced Analysis
+
+```{r}
+# Selecting the variables for cluster
+cluster_data <- vacant_clean %>%
+  select(x_coordinate, y_coordinate, latitude, longitude, ward, police_district, community_area) %>%
+  na.omit()  # Remove any remaining missing values
+```
+
+```{r}
+# Scaling the Data
+cluster_data <- cluster_data %>%
+  mutate(across(everything(), as.numeric))
+cluster_data_scaled <- scale(cluster_data)
+```
+
+```{r}
+# Elbow Method
+set.seed(123)
+wss <- sapply(1:10, function(k){
+  kmeans(cluster_data_scaled, centers = k, nstart = 25)$tot.withinss
+})
+
+# Plotting Elbow Method
+plot(1:10, wss, type = "b", pch = 19, frame = FALSE,
+     xlab = "Number of clusters K",
+     ylab = "Total within-clusters sum of squares",
+     main = "Elbow Method for Choosing K")
+```
+
+```{r}
+# Running the K-means 
+set.seed(123)
+k <- 4  
+kmeans_result <- kmeans(cluster_data_scaled, centers = k, nstart = 25)
+```
+
+```{r}
+vacant_clean$cluster <- kmeans_result$cluster
+```
+
+```{r}
+# Visualizing Clusters
+ggplot(vacant_clean, aes(x = longitude, y = latitude, color = factor(cluster))) +
+  geom_point(alpha = 0.6) +
+  labs(title = "Clustering of Buildings",
+       x = "Longitude", y = "Latitude", color = "Cluster") +
+  theme_minimal()
+```
+
+```{r}
+vacant_clean %>%
+  group_by(cluster) %>%
+  summarise(count = n(),
+            avg_ward = mean(ward, na.rm = TRUE),
+            avg_x = mean(x_coordinate, na.rm = TRUE),
+            avg_y = mean(y_coordinate, na.rm = TRUE))
+```
